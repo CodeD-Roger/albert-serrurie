@@ -1,3 +1,13 @@
+# Déploiement du site albert-serrurie vers Hostinger via FTP (FTPS).
+# Secrets requis (Settings → Secrets and variables → Actions) :
+#   FTP_SERVER, FTP_USERNAME, FTP_PASSWORD
+# Le compte FTP Hostinger est cloisonné dans la racine web → server-dir = /
+#
+# Le FTP Hostinger bloque/limite parfois certaines IP de runners GitHub
+# (timeout control socket / max-retries). Retenter depuis le même runner ne
+# sert à rien : le build et le déploiement sont donc séparés, et chaque
+# nouvelle tentative de déploiement tourne dans un JOB distinct → nouveau
+# runner → nouvelle IP.
 name: Deploy to Hostinger
 
 on:
@@ -5,13 +15,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Un seul déploiement à la fois ; on annule un déploiement en cours si un nouveau push arrive
 concurrency:
-  group: deploy-production
+  group: deploy-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -29,28 +38,91 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Garde-fou : on ne déploie jamais un build vide/cassé
-      - name: Verify build output
-        run: test -f dist/index.html || { echo "::error::dist/index.html introuvable — build invalide, déploiement annulé"; exit 1; }
+      # Garantit la présence du .htaccess (routing SPA react-router) dans dist/,
+      # quel que soit le comportement de copie de Vite sur les fichiers cachés.
+      - name: Ensure .htaccess in dist
+        run: cp public/.htaccess dist/.htaccess
 
-      # Déploiement FTPS chiffré via lftp.
-      # Hostinger présente un certificat mutualisé *.hstgr.io qui ne matche ni l'IP ni le domaine :
-      # on garde le chiffrement (ssl-force) mais on désactive la vérification du nom (verify-certificate no).
-      - name: Deploy via FTPS (lftp)
-        env:
-          FTP_SERVER: ${{ secrets.FTP_SERVER }}
-          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
-          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq lftp
-          lftp -c "
-            set ssl:verify-certificate no;
-            set ftp:ssl-force yes;
-            set ftp:ssl-protect-data yes;
-            set net:max-retries 3;
-            set net:timeout 20;
-            set cmd:fail-exit yes;
-            open -u '$FTP_USERNAME','$FTP_PASSWORD' '$FTP_SERVER';
-            mirror -R --delete --parallel=4 --verbose dist/ /;
-            bye;
-          "
+      - name: Verify build output
+        run: test -f dist/index.html && test -f dist/.htaccess
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 1
+          # Sans ceci, le .htaccess (fichier caché) est exclu de l'artefact
+          # et n'atteint jamais Hostinger (défaut depuis upload-artifact v4.4).
+          include-hidden-files: true
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Deploy to Hostinger via FTP
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          timeout: 120000
+          local-dir: ./dist/
+          server-dir: /
+          # Sync incrémental (state file sur le serveur) ; ne supprime pas tout.
+          dangerous-clean-slate: false
+
+  # Tentative 2 : nouveau job → nouveau runner → nouvelle IP.
+  deploy-retry:
+    needs: [build, deploy]
+    if: always() && needs.build.result == 'success' && needs.deploy.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Deploy to Hostinger via FTP (tentative 2, nouvelle IP)
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          timeout: 120000
+          local-dir: ./dist/
+          server-dir: /
+          dangerous-clean-slate: false
+
+  # Tentative 3 : encore un nouveau runner / nouvelle IP.
+  deploy-retry-2:
+    needs: [build, deploy, deploy-retry]
+    if: always() && needs.build.result == 'success' && needs.deploy-retry.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Deploy to Hostinger via FTP (tentative 3, nouvelle IP)
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          timeout: 120000
+          local-dir: ./dist/
+          server-dir: /
+          dangerous-clean-slate: false
